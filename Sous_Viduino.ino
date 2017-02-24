@@ -1,7 +1,12 @@
+#include <Arduino.h>
+
 //-------------------------------------------------------------------
+// Decarboxylor Controller
+// by blackie for Mainely Cannabis, LLC
 //
-// Sous Vide Controller
-// Bill Earl - for Adafruit Industries
+//
+// Based on Sous Vide Controller
+// by Bill Earl - for Adafruit Industries
 //
 // Based on the Arduino PID and PID AutoTune Libraries 
 // by Brett Beauregard
@@ -9,7 +14,7 @@
 
 // PID Library
 #include <PID_v1.h>
-#include <PID_AutoTune_v0.h>
+//#include <PID_AutoTune_v0.h>
 
 // Libraries for the Adafruit RGB/LCD Shield
 #include <Wire.h>
@@ -22,6 +27,47 @@
 // So we can save and retrieve settings
 #include <EEPROM.h>
 
+//for SD card
+#include <SPI.h>
+#include <SD.h>
+#include "RTClib.h"
+
+//for thermocouple
+#include "Adafruit_MAX31855.h"
+
+// A simple data logger for the Arduino analog pins
+
+// how many milliseconds between grabbing data and logging it. 1000 ms is once a second
+#define LOG_INTERVAL  1000 // mills between entries (reduce to take more/faster data)
+
+// how many milliseconds before writing the logged data permanently to disk
+// set it to the LOG_INTERVAL to write each time (safest)
+// set it to 10*LOG_INTERVAL to write all data every 10 datareads, you could lose up to 
+// the last 10 reads if power is lost but it uses less power and is much faster!
+#define SYNC_INTERVAL 1000 // mills between calls to flush() - to write data to the card
+uint32_t syncTime = 0; // time of last sync()
+
+#define ECHO_TO_SERIAL   1 // echo data to serial port
+#define WAIT_TO_START    0 // Wait for serial input in setup()
+
+// the digital pins that connect to the LEDs
+#define redLEDpin 2
+#define greenLEDpin 3
+
+
+RTC_DS1307 rtc; // define the Real Time Clock object
+
+char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+
+
+// for the data logging shield, we use digital pin 10 for the SD cs line
+const int chipSelect = 10;
+
+// the logging file
+File logfile;
+
+
+
 // ************************************************
 // Pin definitions
 // ************************************************
@@ -31,9 +77,14 @@
 
 // One-Wire Temperature Sensor
 // (Use GPIO pins for power/ground to simplify the wiring)
-#define ONE_WIRE_BUS 2
-#define ONE_WIRE_PWR 3
-#define ONE_WIRE_GND 4
+#define ONE_WIRE_BUS 8
+//#define ONE_WIRE_PWR 3
+//#define ONE_WIRE_GND 4
+
+int thermoDO = 9;
+int thermoCS = 4;
+int thermoCLK = 5;
+
 
 // ************************************************
 // PID Variables and constants
@@ -41,8 +92,12 @@
 
 //Define Variables we'll be connecting to
 double Setpoint;
+double DisplaySetpoint;
+double TargetSetpoint;
+
 double Input;
 double Output;
+double Probe;
 
 volatile long onTime = 0;
 
@@ -58,7 +113,8 @@ const int KiAddress = 16;
 const int KdAddress = 24;
 
 //Specify the links and initial tuning parameters
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+//PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+PID myPID(&Input, &Output, &TargetSetpoint, Kp, Ki, Kd, DIRECT);
 
 // 10 second Time Proportional Output window
 int WindowSize = 10000; 
@@ -75,7 +131,10 @@ unsigned int aTuneLookBack=20;
 
 boolean tuning = false;
 
-PID_ATune aTune(&Input, &Output);
+
+boolean hitTarget = false;
+
+//PID_ATune aTune(&Input, &Output);
 
 // ************************************************
 // DiSplay Variables and constants
@@ -113,8 +172,10 @@ long lastLogTime = 0;
 // ************************************************
 // States for state machine
 // ************************************************
-enum operatingState { OFF = 0, SETP, RUN, TUNE_P, TUNE_I, TUNE_D, AUTO};
-operatingState opState = OFF;
+enum operatingState { isOFF = 0, SETP, RUN, TUNE_P, TUNE_I, TUNE_D, AUTO};
+
+
+operatingState opState = isOFF;
 
 // ************************************************
 // Sensor Variables and constants
@@ -129,131 +190,197 @@ DallasTemperature sensors(&oneWire);
 // arrays to hold device address
 DeviceAddress tempSensor;
 
+
 // ************************************************
-// Setup and diSplay initial screen
-// ************************************************
-void setup()
+// thermocouple stuff
+// ***************************
+
+Adafruit_MAX31855 thermocouple(thermoCLK, thermoCS, thermoDO);
+
+void error(char *str)
 {
-   Serial.begin(9600);
+  Serial.print(F("error: "));
+  Serial.println(str);
+  
+  // red LED indicates error
+  digitalWrite(redLEDpin, HIGH);
 
-   // Initialize Relay Control:
+  while(1);
+}
 
-   pinMode(RelayPin, OUTPUT);    // Output mode to drive relay
-   digitalWrite(RelayPin, LOW);  // make sure it is off to start
+// ************************************************
+// Write floating point values to EEPROM
+// ************************************************
+void EEPROM_writeDouble(int address, double value)
+{
+   byte* p = (byte*)(void*)&value;
+   for (int i = 0; i < sizeof(value); i++)
+   {
+      EEPROM.write(address++, *p++);
+   }
+}
 
-   // Set up Ground & Power for the sensor from GPIO pins
+// ************************************************
+// Read floating point values from EEPROM
+// ************************************************
+double EEPROM_readDouble(int address)
+{
+   double value = 0.0;
+   byte* p = (byte*)(void*)&value;
+   for (int i = 0; i < sizeof(value); i++)
+   {
+      *p++ = EEPROM.read(address++);
+   }
+   return value;
+}
 
-   pinMode(ONE_WIRE_GND, OUTPUT);
-   digitalWrite(ONE_WIRE_GND, LOW);
 
-   pinMode(ONE_WIRE_PWR, OUTPUT);
-   digitalWrite(ONE_WIRE_PWR, HIGH);
+// ************************************************
+// Load parameters from EEPROM
+// ************************************************
+void LoadParameters()
+{
+  // Load from EEPROM
+   Setpoint = EEPROM_readDouble(SpAddress);
 
-   // Initialize LCD DiSplay 
-
-   lcd.begin(16, 2);
-   lcd.createChar(1, degree); // create degree symbol from the binary
+   Kp = EEPROM_readDouble(KpAddress);
+   Ki = EEPROM_readDouble(KiAddress);
+   Kd = EEPROM_readDouble(KdAddress);
    
-   lcd.setBacklight(VIOLET);
-   lcd.print(F("    Adafruit"));
-   lcd.setCursor(0, 1);
-   lcd.print(F("   Sous Vide!"));
-
-   // Start up the DS18B20 One Wire Temperature Sensor
-
-   sensors.begin();
-   if (!sensors.getAddress(tempSensor, 0)) 
+   // Use defaults if EEPROM values are invalid
+   if (isnan(Setpoint))
    {
-      lcd.setCursor(0, 1);
-      lcd.print(F("Sensor Error"));
+     Setpoint = 120;
    }
-   sensors.setResolution(tempSensor, 12);
-   sensors.setWaitForConversion(false);
-
-   delay(3000);  // Splash screen
-
-   // Initialize the PID and related variables
-   LoadParameters();
-   myPID.SetTunings(Kp,Ki,Kd);
-
-   myPID.SetSampleTime(1000);
-   myPID.SetOutputLimits(0, WindowSize);
-
-  // Run timer2 interrupt every 15 ms 
-  TCCR2A = 0;
-  TCCR2B = 1<<CS22 | 1<<CS21 | 1<<CS20;
-
-  //Timer2 Overflow Interrupt Enable
-  TIMSK2 |= 1<<TOIE2;
-}
-
-// ************************************************
-// Timer Interrupt Handler
-// ************************************************
-SIGNAL(TIMER2_OVF_vect) 
-{
-  if (opState == OFF)
-  {
-    digitalWrite(RelayPin, LOW);  // make sure relay is off
-  }
-  else
-  {
-    DriveOutput();
-  }
-}
-
-// ************************************************
-// Main Control Loop
-//
-// All state changes pass through here
-// ************************************************
-void loop()
-{
-   // wait for button release before changing state
-   while(ReadButtons() != 0) {}
-
-   lcd.clear();
-
-   switch (opState)
+   if (isnan(Kp))
    {
-   case OFF:
-      Off();
-      break;
-   case SETP:
-      Tune_Sp();
-      break;
-    case RUN:
-      Run();
-      break;
-   case TUNE_P:
-      TuneP();
-      break;
-   case TUNE_I:
-      TuneI();
-      break;
-   case TUNE_D:
-      TuneD();
-      break;
+     Kp = 600;
    }
+   if (isnan(Ki))
+   {
+     Ki = 0.1;
+   }
+   if (isnan(Kd))
+   {
+     Kd = 0.0;
+   }  
+
+      DisplaySetpoint = Setpoint - 3;
+   TargetSetpoint = DisplaySetpoint;
 }
+
 
 // ************************************************
 // Initial State - press RIGHT to enter setpoint
 // ************************************************
 void Off()
 {
+  
+  DateTime now;
+  
    myPID.SetMode(MANUAL);
    lcd.setBacklight(0);
    digitalWrite(RelayPin, LOW);  // make sure it is off
-   lcd.print(F("    Adafruit"));
+   lcd.print(F("Buds, Buds, Buds"));
    lcd.setCursor(0, 1);
-   lcd.print(F("   Sous Vide!"));
+   lcd.print(F(" Decarboxylator!"));
    uint8_t buttons = 0;
    
    while(!(buttons & (BUTTON_RIGHT)))
    {
       buttons = ReadButtons();
+
+
+        DoControl();
+      
+      lcd.setCursor(0,1);
+      lcd.print(Input);
+      lcd.write(1);
+      lcd.print(F("C : "));
+      
+      float pct = map(Output, 0, WindowSize, 0, 1000);
+      lcd.setCursor(10,1);
+      lcd.print(F("      "));
+      lcd.setCursor(10,1);
+      lcd.print(pct/10);
+      //lcd.print(Output);
+      lcd.print(F("%"));
+
+      lcd.setCursor(15,0);
+      if (tuning)
+      {
+        lcd.print("T");
+      }
+      else
+      {
+        lcd.print(" ");
+      }
+      
+      // periodically log to serial port in csv format
+      if (millis() - lastLogTime > logInterval)  
+      {
+        lastLogTime = millis();
+
+// fetch the time
+  now = rtc.now();
+  // log time
+  logfile.print('"');
+  logfile.print(now.year(), DEC);
+  logfile.print(F("/"));
+  logfile.print(now.month(), DEC);
+  logfile.print(F("/"));
+  logfile.print(now.day(), DEC);
+  logfile.print(F(" "));
+  logfile.print(now.hour(), DEC);
+  logfile.print(F(":"));
+  logfile.print(now.minute(), DEC);
+  logfile.print(F(":"));
+  logfile.print(now.second(), DEC);
+  logfile.print('"');
+#if ECHO_TO_SERIAL
+  Serial.print('"');
+  Serial.print(now.year(), DEC);
+  Serial.print(F("/"));
+  Serial.print(now.month(), DEC);
+  Serial.print(F("/"));
+  Serial.print(now.day(), DEC);
+  Serial.print(F(" "));
+  Serial.print(now.hour(), DEC);
+  Serial.print(F(":"));
+  Serial.print(now.minute(), DEC);
+  Serial.print(F(":"));
+  Serial.print(now.second(), DEC);
+  Serial.print('"');
+#endif //ECHO_TO_SERIAL
+
+   logfile.print(F(", "));    
+  logfile.print(F("0"));
+  logfile.print(F(", "));    
+  logfile.print(Input);
+    logfile.print(F(", "));    
+  logfile.print(F("0"));
+#if ECHO_TO_SERIAL
+  Serial.print(F(", "));   
+  Serial.print(F("0"));
+  Serial.print(F(", "));    
+  Serial.print(Input);
+    Serial.print(F(", "));    
+  Serial.print(F("0"));
+      Serial.print(F(", "));    
+  Serial.print(F("0"));
+#endif //ECHO_TO_SERIAL
+
+  logfile.println();
+#if ECHO_TO_SERIAL
+  Serial.println();
+#endif // ECHO_TO_SERIAL
+
+
+      }
+
+      
    }
+   
    // Prepare to transition to the RUN state
    sensors.requestTemperatures(); // Start an asynchronous temperature reading
 
@@ -261,6 +388,7 @@ void Off()
    myPID.SetMode(AUTOMATIC);
    windowStartTime = millis();
    opState = RUN; // start control
+   hitTarget = false;
 }
 
 // ************************************************
@@ -296,12 +424,14 @@ void Tune_Sp()
       }
       if (buttons & BUTTON_UP)
       {
-         Setpoint += increment;
+         DisplaySetpoint += increment;
+         Setpoint = DisplaySetpoint + 3;
          delay(200);
       }
       if (buttons & BUTTON_DOWN)
       {
-         Setpoint -= increment;
+         DisplaySetpoint -= increment;
+         Setpoint = DisplaySetpoint + 3;
          delay(200);
       }
     
@@ -311,7 +441,7 @@ void Tune_Sp()
          return;
       }
       lcd.setCursor(0,1);
-      lcd.print(Setpoint);
+      lcd.print(DisplaySetpoint);
       lcd.print(" ");
       DoControl();
    }
@@ -478,102 +608,145 @@ void TuneD()
    }
 }
 
+
+
+
 // ************************************************
-// PID COntrol State
-// SHIFT and RIGHT for autotune
-// RIGHT - Setpoint
-// LEFT - OFF
+// Check buttons and time-stamp the last press
 // ************************************************
-void Run()
+uint8_t ReadButtons()
 {
-   // set up the LCD's number of rows and columns: 
-   lcd.print(F("Sp: "));
-   lcd.print(Setpoint);
-   lcd.write(1);
-   lcd.print(F("C : "));
+  uint8_t buttons = lcd.readButtons();
+  if (buttons != 0)
+  {
+    lastInput = millis();
+  }
+  return buttons;
+}
 
-   SaveParameters();
-   myPID.SetTunings(Kp,Ki,Kd);
 
-   uint8_t buttons = 0;
-   while(true)
+// ************************************************
+// Save any parameter changes to EEPROM
+// ************************************************
+void SaveParameters()
+{
+   if (Setpoint != EEPROM_readDouble(SpAddress))
    {
-      setBacklight();  // set backlight based on state
-
-      buttons = ReadButtons();
-      if ((buttons & BUTTON_SHIFT) 
-         && (buttons & BUTTON_RIGHT) 
-         && (abs(Input - Setpoint) < 0.5))  // Should be at steady-state
-      {
-         StartAutoTune();
-      }
-      else if (buttons & BUTTON_RIGHT)
-      {
-        opState = SETP;
-        return;
-      }
-      else if (buttons & BUTTON_LEFT)
-      {
-        opState = OFF;
-        return;
-      }
-      
-      DoControl();
-      
-      lcd.setCursor(0,1);
-      lcd.print(Input);
-      lcd.write(1);
-      lcd.print(F("C : "));
-      
-      float pct = map(Output, 0, WindowSize, 0, 1000);
-      lcd.setCursor(10,1);
-      lcd.print(F("      "));
-      lcd.setCursor(10,1);
-      lcd.print(pct/10);
-      //lcd.print(Output);
-      lcd.print("%");
-
-      lcd.setCursor(15,0);
-      if (tuning)
-      {
-        lcd.print("T");
-      }
-      else
-      {
-        lcd.print(" ");
-      }
-      
-      // periodically log to serial port in csv format
-      if (millis() - lastLogTime > logInterval)  
-      {
-        lastLogTime = millis();
-        Serial.print(Input);
-        Serial.print(",");
-        Serial.println(Output);
-      }
-
-      delay(100);
+      EEPROM_writeDouble(SpAddress, Setpoint);
+   }
+   if (Kp != EEPROM_readDouble(KpAddress))
+   {
+      EEPROM_writeDouble(KpAddress, Kp);
+   }
+   if (Ki != EEPROM_readDouble(KiAddress))
+   {
+      EEPROM_writeDouble(KiAddress, Ki);
+   }
+   if (Kd != EEPROM_readDouble(KdAddress))
+   {
+      EEPROM_writeDouble(KdAddress, Kd);
    }
 }
+
+
+// ************************************************
+// Set Backlight based on the state of control
+// ************************************************
+void setBacklight()
+{
+   if (tuning)
+   {
+      lcd.setBacklight(VIOLET); // Tuning Mode
+   }
+   else if (abs(Input - DisplaySetpoint) > 1.0)  
+   {
+      lcd.setBacklight(RED);  // High Alarm - off by more than 1 degree
+   }
+   else if (abs(Input - DisplaySetpoint) > 0.50)  
+   {
+      lcd.setBacklight(YELLOW);  // Low Alarm - off by more than 0.2 degrees
+   }
+   else
+   {
+      lcd.setBacklight(WHITE);  // We're on target!
+   }
+}
+
 
 // ************************************************
 // Execute the control loop
 // ************************************************
 void DoControl()
 {
-  // Read the input:
+    //   Input = thermocouple.readCelsius();
+
+
+ double c = thermocouple.readCelsius();
+double d = Setpoint - Input;
+   if (isnan(c)) {
+    Serial.println("Something wrong with thermocouple!");
+   } else {
+
+        Input = c;
+
+
+/*
+    if (hitTarget == false) {   
+            TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, Input+d);
+                if(d <= 4){
+                      hitTarget = true;
+                  }
+             }
+*/
+             
+     
+            if (hitTarget == false) {
+              if ((d) >= 70){
+                   TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, DisplaySetpoint);
+                    } 
+                     if ((d) < 70){
+                   TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, (Input + 20));
+                    } 
+                     if ((d) <= 40){
+                   TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, (Input + 10));
+                    } 
+
+                 //    if ((d) <= 20){
+                 //  TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, (Input + 5));
+                //    } 
+                    if ((d) <= 7){
+                   TargetSetpoint = map(Input, (Input - 1), (Input + 1), Input, (Setpoint+2));
+                    } 
+               
+                   if(d <= 4){
+                        hitTarget = true;
+                     }
+   
+               
+             }
+
+
+
+              if (hitTarget == true){
+              TargetSetpoint = Setpoint;
+             }          
+        }
+
+
+  // Read the probe input:
   if (sensors.isConversionAvailable(0))
   {
-    Input = sensors.getTempC(tempSensor);
+   // Input = sensors.getTempC(tempSensor);
+    Probe = sensors.getTempC(tempSensor);
     sensors.requestTemperatures(); // prime the pump for the next one - but don't wait
   }
   
   if (tuning) // run the auto-tuner
   {
-     if (aTune.Runtime()) // returns 'true' when done
-     {
-        FinishAutoTune();
-     }
+ //    if (aTune.Runtime()) // returns 'true' when done
+ //    {
+ //       FinishAutoTune();
+  //   }
   }
   else // Execute control algorithm
   {
@@ -607,153 +780,382 @@ void DriveOutput()
 }
 
 // ************************************************
-// Set Backlight based on the state of control
-// ************************************************
-void setBacklight()
-{
-   if (tuning)
-   {
-      lcd.setBacklight(VIOLET); // Tuning Mode
-   }
-   else if (abs(Input - Setpoint) > 1.0)  
-   {
-      lcd.setBacklight(RED);  // High Alarm - off by more than 1 degree
-   }
-   else if (abs(Input - Setpoint) > 0.2)  
-   {
-      lcd.setBacklight(YELLOW);  // Low Alarm - off by more than 0.2 degrees
-   }
-   else
-   {
-      lcd.setBacklight(WHITE);  // We're on target!
-   }
-}
-
-// ************************************************
 // Start the Auto-Tuning cycle
 // ************************************************
 
-void StartAutoTune()
-{
-   // REmember the mode we were in
-   ATuneModeRemember = myPID.GetMode();
+//void StartAutoTune()
+//{
+///   // REmember the mode we were in
+ //  ATuneModeRemember = myPID.GetMode();
 
    // set up the auto-tune parameters
-   aTune.SetNoiseBand(aTuneNoise);
-   aTune.SetOutputStep(aTuneStep);
-   aTune.SetLookbackSec((int)aTuneLookBack);
-   tuning = true;
-}
+//   aTune.SetNoiseBand(aTuneNoise);
+//   aTune.SetOutputStep(aTuneStep);
+ //  aTune.SetLookbackSec((int)aTuneLookBack);
+ //  tuning = true;
+//}
 
 // ************************************************
 // Return to normal control
 // ************************************************
-void FinishAutoTune()
-{
-   tuning = false;
+//void FinishAutoTune()
+//{
+//   tuning = false;
 
    // Extract the auto-tune calculated parameters
-   Kp = aTune.GetKp();
-   Ki = aTune.GetKi();
-   Kd = aTune.GetKd();
+////   Kp = aTune.GetKp();
+ //  Ki = aTune.GetKi();
+ //  Kd = aTune.GetKd();
 
    // Re-tune the PID and revert to normal control mode
-   myPID.SetTunings(Kp,Ki,Kd);
-   myPID.SetMode(ATuneModeRemember);
+//   myPID.SetTunings(Kp,Ki,Kd);
+//   myPID.SetMode(ATuneModeRemember);
    
    // Persist any changed parameters to EEPROM
-   SaveParameters();
-}
+ //  SaveParameters();
+//}
+
+
 
 // ************************************************
-// Check buttons and time-stamp the last press
+// 
 // ************************************************
-uint8_t ReadButtons()
+void OpenSDlogfile()
 {
-  uint8_t buttons = lcd.readButtons();
-  if (buttons != 0)
-  {
-    lastInput = millis();
+
+ // create a new file
+  char filename[] = "LOGGER00.CSV";
+  for (uint8_t i = 0; i < 100; i++) {
+    filename[6] = i/10 + '0';
+    filename[7] = i%10 + '0';
+    if (! SD.exists(filename)) {
+      // only open a new file if it doesn't exist
+      logfile = SD.open(filename, FILE_WRITE); 
+      break;  // leave the loop!
+    }
   }
-  return buttons;
+
+if (! logfile) {
+    error("couldnt create file");
+  }
+  
+  Serial.print(F("Logging to: "));
+  Serial.println(filename);
 }
 
-// ************************************************
-// Save any parameter changes to EEPROM
-// ************************************************
-void SaveParameters()
-{
-   if (Setpoint != EEPROM_readDouble(SpAddress))
-   {
-      EEPROM_writeDouble(SpAddress, Setpoint);
-   }
-   if (Kp != EEPROM_readDouble(KpAddress))
-   {
-      EEPROM_writeDouble(KpAddress, Kp);
-   }
-   if (Ki != EEPROM_readDouble(KiAddress))
-   {
-      EEPROM_writeDouble(KiAddress, Ki);
-   }
-   if (Kd != EEPROM_readDouble(KdAddress))
-   {
-      EEPROM_writeDouble(KdAddress, Kd);
-   }
-}
+
 
 // ************************************************
-// Load parameters from EEPROM
+// Setup and diSplay initial screen
 // ************************************************
-void LoadParameters()
+void setup()
 {
-  // Load from EEPROM
-   Setpoint = EEPROM_readDouble(SpAddress);
-   Kp = EEPROM_readDouble(KpAddress);
-   Ki = EEPROM_readDouble(KiAddress);
-   Kd = EEPROM_readDouble(KdAddress);
+   Serial.begin(9600);
+
+   // Initialize Relay Control:
+
+   pinMode(RelayPin, OUTPUT);    // Output mode to drive relay
+   digitalWrite(RelayPin, LOW);  // make sure it is off to start
+
+  // use debugging LEDs
+  pinMode(redLEDpin, OUTPUT);
+  pinMode(greenLEDpin, OUTPUT);
+
+   // connect to RTC
+  Wire.begin();  
+  if (!rtc.begin()) {
+  //  logfile.println("RTC failed");
+#if ECHO_TO_SERIAL
+    Serial.println("RTC failed");
+#endif  //ECHO_TO_SERIAL
+  }
+   // initialize the SD card
+  Serial.print("Initializing SD card...");
+  // make sure that the default chip select pin is set to
+  // output, even if you don't use it:
+  pinMode(10, OUTPUT);
+  
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    error("Card failed, or not present");
+  }
+  Serial.println("card initialized.");
+
+//OpenSDlogfile();
+
+// create a new file
+  char filename[] = "LOGGER00.CSV";
+  for (uint8_t i = 0; i < 100; i++) {
+    filename[6] = i/10 + '0';
+    filename[7] = i%10 + '0';
+    if (! SD.exists(filename)) {
+      // only open a new file if it doesn't exist
+      logfile = SD.open(filename, FILE_WRITE); 
+      break;  // leave the loop!
+    }
+  }
+
+if (! logfile) {
+    error("couldnt create file");
+  }
+  
+  Serial.print(F("Logging to: "));
+  Serial.println(filename);
+
+  logfile.println(F("datetime,setpoint,input,output"));    
+#if ECHO_TO_SERIAL
+  Serial.println(F("datetime,setpoint,input,output"));
+#endif //ECHO_TO_SERIAL
+ 
+
+   // Set up Ground & Power for the sensor from GPIO pins
+
+ //  pinMode(ONE_WIRE_GND, OUTPUT);
+ //  digitalWrite(ONE_WIRE_GND, LOW);
+
+ //  pinMode(ONE_WIRE_PWR, OUTPUT);
+ //  digitalWrite(ONE_WIRE_PWR, HIGH);
+
+   // Initialize LCD DiSplay 
+
+   lcd.begin(16, 2);
+   lcd.createChar(1, degree); // create degree symbol from the binary
    
-   // Use defaults if EEPROM values are invalid
-   if (isnan(Setpoint))
+   lcd.setBacklight(VIOLET);
+   lcd.print(F("Buds, Buds, Buds"));
+   lcd.setCursor(0, 1);
+   lcd.print(F(" Decarboxylator!"));
+
+   // Start up the DS18B20 One Wire Temperature Sensor
+
+   sensors.begin();
+   if (!sensors.getAddress(tempSensor, 0)) 
    {
-     Setpoint = 60;
+      lcd.setCursor(0, 1);
+      lcd.print(F("Sensor Error"));
    }
-   if (isnan(Kp))
-   {
-     Kp = 850;
-   }
-   if (isnan(Ki))
-   {
-     Ki = 0.5;
-   }
-   if (isnan(Kd))
-   {
-     Kd = 0.1;
-   }  
+   sensors.setResolution(tempSensor, 12);
+   sensors.setWaitForConversion(false);
+
+   delay(3000);  // Splash screen
+
+   // Initialize the PID and related variables
+   LoadParameters();
+   myPID.SetTunings(Kp,Ki,Kd);
+
+   myPID.SetSampleTime(1000);
+   myPID.SetOutputLimits(0, WindowSize);
+
+  // Run timer2 interrupt every 15 ms 
+  TCCR2A = 0;
+  TCCR2B = 1<<CS22 | 1<<CS21 | 1<<CS20;
+
+  //Timer2 Overflow Interrupt Enable
+  TIMSK2 |= 1<<TOIE2;
+
+
 }
 
-
 // ************************************************
-// Write floating point values to EEPROM
+// Timer Interrupt Handler
 // ************************************************
-void EEPROM_writeDouble(int address, double value)
+SIGNAL(TIMER2_OVF_vect) 
 {
-   byte* p = (byte*)(void*)&value;
-   for (int i = 0; i < sizeof(value); i++)
-   {
-      EEPROM.write(address++, *p++);
-   }
+  if (opState == isOFF)
+  {
+    digitalWrite(RelayPin, LOW);  // make sure relay is off
+  }
+  else
+  {
+    DriveOutput();
+  }
 }
 
 // ************************************************
-// Read floating point values from EEPROM
+// Main Control Loop
+//
+// All state changes pass through here
 // ************************************************
-double EEPROM_readDouble(int address)
+void loop()
 {
-   double value = 0.0;
-   byte* p = (byte*)(void*)&value;
-   for (int i = 0; i < sizeof(value); i++)
+
+ // Now we write data to SD! Don't sync too often - requires 2048 bytes of I/O to SD card
+  // which uses a bunch of power and takes time
+  if ((millis() - syncTime) > SYNC_INTERVAL) {
+  syncTime = millis();
+  
+  // blink LED to show we are syncing data to the card & updating FAT!
+  digitalWrite(redLEDpin, HIGH);
+  logfile.flush();
+  digitalWrite(redLEDpin, LOW);
+  }
+
+  
+   // wait for button release before changing state
+   while(ReadButtons() != 0) {}
+
+
+   lcd.clear();
+
+   switch (opState)
    {
-      *p++ = EEPROM.read(address++);
+   case isOFF:
+      Off();
+      break;
+   case SETP:
+      Tune_Sp();
+      break;
+    case RUN:
+      Run();
+      break;
+   case TUNE_P:
+      TuneP();
+      break;
+   case TUNE_I:
+      TuneI();
+      break;
+   case TUNE_D:
+      TuneD();
+      break;
    }
-   return value;
+
+
+   
 }
+// ************************************************
+// PID COntrol State
+// SHIFT and RIGHT for autotune
+// RIGHT - Setpoint
+// LEFT - OFF
+// ************************************************
+void Run()
+{
+ DateTime now;
+  
+   // set up the LCD's number of rows and columns: 
+   lcd.print(F("Sp: "));
+   lcd.print(DisplaySetpoint);
+   lcd.write(1);
+   lcd.print(F("C : "));
+
+   SaveParameters();
+   myPID.SetTunings(Kp,Ki,Kd);
+
+   uint8_t buttons = 0;
+   while(true)
+   {
+      setBacklight();  // set backlight based on state
+
+      buttons = ReadButtons();
+      if ((buttons & BUTTON_SHIFT) 
+         && (buttons & BUTTON_RIGHT) 
+         && (abs(Input - DisplaySetpoint) < 0.5))  // Should be at steady-state
+      {
+   //      StartAutoTune();
+      }
+      else if (buttons & BUTTON_RIGHT)
+      {
+        opState = SETP;
+        return;
+      }
+      else if (buttons & BUTTON_LEFT)
+      {
+        opState = isOFF;
+        return;
+      }
+      
+      DoControl();
+      
+      lcd.setCursor(0,1);
+      lcd.print(Input);
+      lcd.write(1);
+      lcd.print(F("C : "));
+      
+      float pct = map(Output, 0, WindowSize, 0, 1000);
+      lcd.setCursor(10,1);
+      lcd.print(F("      "));
+      lcd.setCursor(10,1);
+      lcd.print(pct/10);
+      //lcd.print(Output);
+      lcd.print("%");
+
+      lcd.setCursor(15,0);
+      if (tuning)
+      {
+        lcd.print("T");
+      }
+      else
+      {
+        lcd.print(" ");
+      }
+      
+      // periodically log to serial port in csv format
+      if (millis() - lastLogTime > logInterval)  
+      {
+        lastLogTime = millis();
+
+
+
+// fetch the time
+  now = rtc.now();
+  // log time
+  logfile.print('"');
+  logfile.print(now.year(), DEC);
+  logfile.print("/");
+  logfile.print(now.month(), DEC);
+  logfile.print("/");
+  logfile.print(now.day(), DEC);
+  logfile.print(" ");
+  logfile.print(now.hour(), DEC);
+  logfile.print(":");
+  logfile.print(now.minute(), DEC);
+  logfile.print(":");
+  logfile.print(now.second(), DEC);
+  logfile.print('"');
+#if ECHO_TO_SERIAL
+  Serial.print('"');
+  Serial.print(now.year(), DEC);
+  Serial.print("/");
+  Serial.print(now.month(), DEC);
+  Serial.print("/");
+  Serial.print(now.day(), DEC);
+  Serial.print(" ");
+  Serial.print(now.hour(), DEC);
+  Serial.print(":");
+  Serial.print(now.minute(), DEC);
+  Serial.print(":");
+  Serial.print(now.second(), DEC);
+  Serial.print('"');
+#endif //ECHO_TO_SERIAL
+
+   logfile.print(", ");    
+  logfile.print(DisplaySetpoint);
+  logfile.print(", ");    
+  logfile.print(Input);
+    logfile.print(", ");    
+  logfile.print(pct/10);
+#if ECHO_TO_SERIAL
+  Serial.print(", ");   
+  Serial.print(DisplaySetpoint);
+  Serial.print(", ");    
+  Serial.print(Input);
+    Serial.print(", ");    
+  Serial.print(pct/10);
+    Serial.print(", ");   
+  Serial.print(TargetSetpoint);
+  
+#endif //ECHO_TO_SERIAL
+
+  logfile.println();
+#if ECHO_TO_SERIAL
+  Serial.println();
+#endif // ECHO_TO_SERIAL
+
+
+      }
+
+      delay(100);
+   }
+}
+
+
